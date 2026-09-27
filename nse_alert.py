@@ -60,16 +60,32 @@ def save_state(state):
 
 def nse_session():
     s = requests.Session()
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": NSE_HOME,
+        "Referer": "https://www.nseindia.com/",
         "Connection": "keep-alive",
     }
+
     s.headers.update(headers)
-    r = s.get(NSE_HOME, timeout=20)
+
+    r = s.get(
+        "https://www.nseindia.com/",
+        timeout=30,
+        allow_redirects=True
+    )
+
+    if r.status_code == 403:
+        raise RuntimeError(
+            "NSE is blocking the GitHub Actions IP (HTTP 403)."
+        )
+
     r.raise_for_status()
     return s
 
