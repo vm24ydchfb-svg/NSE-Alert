@@ -4,10 +4,11 @@ import json
 import time
 import html
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -34,10 +35,26 @@ NSE_FILINGS_URL = (
     "corporate-filings-announcements"
 )
 
-# Short network timeouts prevent GitHub Actions from hanging for minutes.
 CONNECT_TIMEOUT = 6
 READ_TIMEOUT = 12
 RETRIES = 2
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+# ---------------------------------------------------------------------------
+# NSE MARKET HOURS
+# ---------------------------------------------------------------------------
+
+def market_is_open():
+    now = datetime.now(IST)
+
+    # Monday-Friday only
+    if now.weekday() >= 5:
+        return False
+
+    # NSE regular equity market
+    return dt_time(9, 15) <= now.time() <= dt_time(15, 30)
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +142,15 @@ def load_state():
             return data
     except Exception:
         pass
+
     return {"seen": []}
 
 
 def save_state(state):
-    state["seen"] = list(dict.fromkeys(state.get("seen", [])))[-1000:]
+    state["seen"] = list(
+        dict.fromkeys(state.get("seen", []))
+    )[-1000:]
+
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False),
         encoding="utf-8",
@@ -143,6 +164,7 @@ def save_state(state):
 def text_of(value):
     if value is None:
         return ""
+
     value = html.unescape(str(value))
     return re.sub(r"\s+", " ", value).strip()
 
@@ -153,15 +175,19 @@ def local_now():
 
 def parse_dt(value):
     value = text_of(value)
+
     if not value:
         return None
 
     try:
         dt = parsedate_to_datetime(value)
+
         if dt is not None:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=local_now().tzinfo)
+
             return dt.astimezone()
+
     except (TypeError, ValueError, OverflowError):
         pass
 
@@ -179,9 +205,12 @@ def parse_dt(value):
     for fmt in formats:
         try:
             dt = datetime.strptime(value, fmt)
+
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=local_now().tzinfo)
+
             return dt.astimezone()
+
         except ValueError:
             continue
 
@@ -192,12 +221,14 @@ def clean_html(value):
     value = html.unescape(text_of(value))
     value = re.sub(r"<br\s*/?>", "\n", value, flags=re.I)
     value = re.sub(r"<[^>]+>", " ", value)
+
     return re.sub(r"\s+", " ", value).strip()
 
 
 def xml_text(element):
     if element is None:
         return ""
+
     return "".join(element.itertext()).strip()
 
 
@@ -206,8 +237,10 @@ def child_text(parent, names):
 
     for child in list(parent):
         tag = child.tag
+
         if "}" in tag:
             tag = tag.rsplit("}", 1)[-1]
+
         if tag.lower() in wanted:
             return xml_text(child)
 
@@ -228,9 +261,7 @@ def nse_session():
             "Version/17.0 Mobile/15E148 Safari/604.1"
         ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": (
-            "application/json, text/plain, */*"
-        ),
+        "Accept": "application/json, text/plain, */*",
         "Referer": NSE_BASE_URL + "/",
         "Origin": NSE_BASE_URL,
         "Connection": "keep-alive",
@@ -250,14 +281,18 @@ def request_with_retry(session, method, url, **kwargs):
                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                 **kwargs,
             )
+
             response.raise_for_status()
             return response
+
         except requests.RequestException as exc:
             last_error = exc
+
             print(
                 f"HTTP attempt {attempt + 1}/{RETRIES} failed: "
                 f"{type(exc).__name__}: {exc}"
             )
+
             if attempt + 1 < RETRIES:
                 time.sleep(1.5)
 
@@ -269,7 +304,6 @@ def request_with_retry(session, method, url, **kwargs):
 # ---------------------------------------------------------------------------
 
 def normalize_api_row(item):
-    # NSE field names can vary slightly. Prefer the structured fields.
     symbol = text_of(
         item.get("symbol")
         or item.get("SYMBOL")
@@ -321,7 +355,6 @@ def normalize_api_row(item):
 
     link = attachment
 
-    # NSE sometimes returns a relative attachment path.
     if link and link.startswith("/"):
         link = NSE_BASE_URL + link
 
@@ -339,21 +372,24 @@ def normalize_api_row(item):
 def fetch_announcements_api():
     session = nse_session()
 
-    # Prime NSE cookies before calling the API. This is important on
-    # environments such as GitHub Actions.
     request_with_retry(
         session,
         "GET",
         NSE_BASE_URL + "/",
         headers={
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "Accept": (
+                "text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,*/*;q=0.8"
+            )
         },
     )
 
     now = local_now()
-    # Fetch today's and yesterday's announcements. We filter locally to the
-    # configured LOOKBACK_MINUTES, which avoids boundary issues around midnight.
-    from_date = (now - timedelta(days=1)).strftime("%d-%m-%Y")
+
+    from_date = (
+        now - timedelta(days=1)
+    ).strftime("%d-%m-%Y")
+
     to_date = now.strftime("%d-%m-%Y")
 
     params = {
@@ -371,36 +407,46 @@ def fetch_announcements_api():
 
     try:
         payload = response.json()
+
     except ValueError as exc:
         raise RuntimeError(
-            f"NSE API returned non-JSON data (HTTP {response.status_code})"
+            f"NSE API returned non-JSON data "
+            f"(HTTP {response.status_code})"
         ) from exc
 
     if not isinstance(payload, list):
+
         if isinstance(payload, dict):
+
             for key in ("data", "results", "records"):
+
                 if isinstance(payload.get(key), list):
                     payload = payload[key]
                     break
 
     if not isinstance(payload, list):
-        raise RuntimeError("NSE API returned an unexpected response shape.")
+        raise RuntimeError(
+            "NSE API returned an unexpected response shape."
+        )
 
     rows = []
 
     for item in payload:
+
         if isinstance(item, dict):
+
             row = normalize_api_row(item)
 
             if row["title"] or row["description"]:
                 rows.append(row)
 
     if not rows:
-        # Empty is allowed from NSE when there are genuinely no announcements,
-        # but only after a valid API response was received.
         return []
 
-    print(f"NSE API: received {len(rows)} announcements.")
+    print(
+        f"NSE API: received {len(rows)} announcements."
+    )
+
     return rows
 
 
@@ -415,7 +461,10 @@ def fetch_announcements_rss():
             "AppleWebKit/605.1.15 (KHTML, like Gecko) "
             "Version/17.0 Mobile/15E148 Safari/604.1"
         ),
-        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept": (
+            "application/rss+xml, application/xml, "
+            "text/xml, */*"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
     }
 
@@ -429,10 +478,13 @@ def fetch_announcements_rss():
     )
 
     root = ET.fromstring(response.content)
+
     rows = []
 
     for item in root.iter():
+
         tag = item.tag
+
         if "}" in tag:
             tag = tag.rsplit("}", 1)[-1]
 
@@ -440,24 +492,40 @@ def fetch_announcements_rss():
             continue
 
         title = child_text(item, ["title"])
+
         description = child_text(
             item,
             ["description", "summary", "content", "encoded"],
         )
+
         pub_date = child_text(
             item,
             ["pubDate", "published", "updated", "date"],
         )
+
         link = child_text(item, ["link"])
-        guid = child_text(item, ["guid", "id"])
+
+        guid = child_text(
+            item,
+            ["guid", "id"],
+        )
 
         if not link:
+
             for child in list(item):
+
                 ctag = child.tag
+
                 if "}" in ctag:
                     ctag = ctag.rsplit("}", 1)[-1]
+
                 if ctag.lower() == "link":
-                    link = child.attrib.get("href", "")
+
+                    link = child.attrib.get(
+                        "href",
+                        "",
+                    )
+
                     if link:
                         break
 
@@ -472,27 +540,41 @@ def fetch_announcements_rss():
         })
 
     if not rows:
-        raise RuntimeError("NSE RSS feed returned no announcements.")
+        raise RuntimeError(
+            "NSE RSS feed returned no announcements."
+        )
 
-    print(f"NSE RSS: received {len(rows)} announcements.")
+    print(
+        f"NSE RSS: received {len(rows)} announcements."
+    )
+
     return rows
 
 
 def fetch_announcements():
-    # API is the primary source because it exposes structured symbol/date data.
+
     try:
         return fetch_announcements_api()
+
     except Exception as api_error:
-        print(f"NSE API unavailable: {api_error}")
-        print("Trying official NSE RSS fallback...")
+
+        print(
+            f"NSE API unavailable: {api_error}"
+        )
+
+        print(
+            "Trying official NSE RSS fallback..."
+        )
 
     try:
         return fetch_announcements_rss()
-    except Exception as rss_error:
-        print(f"NSE RSS unavailable: {rss_error}")
 
-    # Critical: do NOT return [] here. Returning [] would falsely mean
-    # "there were no announcements" and could hide a data outage.
+    except Exception as rss_error:
+
+        print(
+            f"NSE RSS unavailable: {rss_error}"
+        )
+
     raise RuntimeError(
         "Both NSE corporate-announcement sources are unavailable. "
         "No alert decision was made."
@@ -507,7 +589,11 @@ def announcement_id(row):
     return (
         text_of(row.get("guid"))
         or text_of(row.get("link"))
-        or json.dumps(row, sort_keys=True, ensure_ascii=False)[:500]
+        or json.dumps(
+            row,
+            sort_keys=True,
+            ensure_ascii=False,
+        )[:500]
     )
 
 
@@ -517,19 +603,22 @@ def announcement_time(row):
 
 def extract_symbol(text):
     match = re.search(
-        r"\b(?:NSE\s*:\s*)?([A-Z][A-Z0-9&.-]{1,19})\b",
+        r"\b(?:NSE\s*:\s*)?"
+        r"([A-Z][A-Z0-9&.-]{1,19})\b",
         text,
     )
 
     if match:
+
         candidate = match.group(1)
 
         stop = {
-            "THE", "AND", "FOR", "NSE", "BSE", "LTD", "LIMITED",
-            "COMPANY", "WITH", "FROM", "ABOUT", "HAS", "HAVE",
-            "UNDER", "REGULATION", "DISCLOSURE", "EXCHANGE",
-            "BOARD", "APPROVAL", "NOTICE", "UPDATE", "ORDER",
-            "DATE", "TIME", "INDIA", "INDIAN", "PUBLIC", "GENERAL",
+            "THE", "AND", "FOR", "NSE", "BSE", "LTD",
+            "LIMITED", "COMPANY", "WITH", "FROM", "ABOUT",
+            "HAS", "HAVE", "UNDER", "REGULATION", "DISCLOSURE",
+            "EXCHANGE", "BOARD", "APPROVAL", "NOTICE", "UPDATE",
+            "ORDER", "DATE", "TIME", "INDIA", "INDIAN", "PUBLIC",
+            "GENERAL",
         }
 
         if candidate not in stop:
@@ -541,17 +630,20 @@ def extract_symbol(text):
 def score_row(row):
     subject = text_of(row.get("title"))
     details = text_of(row.get("description"))
+
     blob = f"{subject} {details}".lower()
 
     score = 0
     hits = []
 
     for keyword, value in HIGH.items():
+
         if keyword in blob:
             score += value
             hits.append(keyword)
 
     for keyword, value in LOW.items():
+
         if keyword in blob:
             score += value
 
@@ -560,6 +652,7 @@ def score_row(row):
 
 def filing_url(row):
     link = text_of(row.get("link"))
+
     if link:
         return link
 
@@ -567,12 +660,15 @@ def filing_url(row):
 
     if not symbol:
         symbol = extract_symbol(
-            f"{row.get('title', '')} {row.get('description', '')}"
+            f"{row.get('title', '')} "
+            f"{row.get('description', '')}"
         )
 
     if symbol and symbol != "UNKNOWN":
+
         return (
-            f"{NSE_FILINGS_URL}?symbol={quote(symbol)}"
+            f"{NSE_FILINGS_URL}"
+            f"?symbol={quote(symbol)}"
             f"&tabIndex=equity"
         )
 
@@ -584,10 +680,16 @@ def filing_url(row):
 # ---------------------------------------------------------------------------
 
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
     if len(message) > 4000:
-        message = message[:3980] + "\n\n[Message truncated]"
+        message = (
+            message[:3980]
+            + "\n\n[Message truncated]"
+        )
 
     response = requests.post(
         url,
@@ -598,6 +700,7 @@ def send_telegram(message):
         },
         timeout=(5, 15),
     )
+
     response.raise_for_status()
 
 
@@ -606,21 +709,55 @@ def send_telegram(message):
 # ---------------------------------------------------------------------------
 
 def main():
+
+    # -------------------------------------------------------
+    # MARKET HOURS CHECK
+    # -------------------------------------------------------
+
+    if not market_is_open():
+
+        now = datetime.now(IST)
+
+        print(
+            "Outside NSE market hours. "
+            f"Current IST time: "
+            f"{now.strftime('%d-%b-%Y %H:%M:%S')}"
+        )
+
+        return
+
+    # -------------------------------------------------------
+    # NORMAL BOT LOGIC
+    # -------------------------------------------------------
+
     state = load_state()
-    seen = set(state.get("seen", []))
+
+    seen = set(
+        state.get("seen", [])
+    )
 
     now = local_now()
-    cutoff = now - timedelta(minutes=LOOKBACK_MINUTES)
+
+    cutoff = (
+        now
+        - timedelta(
+            minutes=LOOKBACK_MINUTES
+        )
+    )
 
     print(
-        f"Starting NSE Alert | now={now.isoformat()} | "
-        f"lookback={LOOKBACK_MINUTES}m | min_score={MIN_SCORE}"
+        f"Starting NSE Alert | "
+        f"now={now.isoformat()} | "
+        f"lookback={LOOKBACK_MINUTES}m | "
+        f"min_score={MIN_SCORE}"
     )
 
     rows = fetch_announcements()
+
     candidates = []
 
     for row in rows:
+
         rid = announcement_id(row)
 
         if rid in seen:
@@ -628,8 +765,11 @@ def main():
 
         dt = announcement_time(row)
 
-        # Never alert on an item whose timestamp cannot be parsed.
-        if dt is None or dt < cutoff or dt > now + timedelta(minutes=2):
+        if (
+            dt is None
+            or dt < cutoff
+            or dt > now + timedelta(minutes=2)
+        ):
             continue
 
         score, hits, subject, details = score_row(row)
@@ -637,12 +777,15 @@ def main():
         if score < MIN_SCORE:
             continue
 
-        symbol = text_of(row.get("symbol"))
+        symbol = text_of(
+            row.get("symbol")
+        )
 
-        # The API gives us the exact NSE symbol. Only use regex extraction
-        # when the source does not provide one.
         if not symbol:
-            symbol = extract_symbol(f"{subject} {details}")
+
+            symbol = extract_symbol(
+                f"{subject} {details}"
+            )
 
         candidates.append(
             (
@@ -657,42 +800,72 @@ def main():
             )
         )
 
-    candidates.sort(key=lambda x: x[0])
+    candidates.sort(
+        key=lambda x: x[0]
+    )
 
     print(
         f"Fetched {len(rows)} announcements; "
         f"{len(candidates)} high-impact candidates."
     )
 
-    for dt, score, symbol, subject, details, hits, url, rid in candidates:
-        hit_text = ", ".join(hits[:6]) if hits else "material filing"
+    for (
+        dt,
+        score,
+        symbol,
+        subject,
+        details,
+        hits,
+        url,
+        rid,
+    ) in candidates:
+
+        hit_text = (
+            ", ".join(hits[:6])
+            if hits
+            else "material filing"
+        )
 
         message = (
-            "ð¨ NSE HIGH-IMPACT ALERT\n\n"
-            f"ð {symbol}\n"
-            f"ð {dt.strftime('%d-%b-%Y %H:%M:%S %Z')}\n"
-            f"ð Score: {score}\n"
-            f"ð Trigger: {hit_text}\n\n"
-            f"ð° {subject[:700]}\n"
+            "🚨 NSE HIGH-IMPACT ALERT\n\n"
+            f"📌 {symbol}\n"
+            f"🕒 {dt.strftime('%d-%b-%Y %H:%M:%S %Z')}\n"
+            f"📈 Score: {score}\n"
+            f"🔎 Trigger: {hit_text}\n\n"
+            f"📰 {subject[:700]}\n"
             f"{details[:1400]}\n\n"
-            f"ð Verify filing:\n{url}\n\n"
-            "â ï¸ Public filing alert â verify the original exchange "
-            "document before making any decision."
+            f"🔗 Verify filing:\n{url}\n\n"
+            "⚠️ Public filing alert — verify the original "
+            "exchange document before making any decision."
         )
 
         send_telegram(message)
-        print(f"Telegram alert sent: {symbol} | {subject[:100]}")
+
+        print(
+            f"Telegram alert sent: "
+            f"{symbol} | {subject[:100]}"
+        )
+
         seen.add(rid)
 
     state["seen"] = list(seen)
+
     save_state(state)
 
-    print("NSE Alert completed successfully.")
+    print(
+        "NSE Alert completed successfully."
+    )
 
 
 if __name__ == "__main__":
+
     try:
         main()
+
     except Exception as exc:
-        print(f"FATAL: {type(exc).__name__}: {exc}")
+
+        print(
+            f"FATAL: {type(exc).__name__}: {exc}"
+        )
+
         raise
