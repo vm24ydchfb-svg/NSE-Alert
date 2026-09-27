@@ -22,9 +22,22 @@ jobs:
         run: |
           pip install requests beautifulsoup4
 
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: seen.json
+          key: nse-seen-${{ github.run_id }}
+          restore-keys: |
+            nse-seen-
+
       - name: Run NSE alert bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python nse_alert.py
-              
+
+      - name: Save alert state
+        uses: actions/cache/save@v4
+        with:
+          path: seen.json
+          key: nse-seen-${{ github.run_id }}
